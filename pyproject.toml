@@ -1,0 +1,20 @@
+[project]
+name = "ddc"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "August", email = "augustlin114514@qq.com" }
+]
+requires-python = ">=3.9"
+dependencies = [
+    "scipy==1.10.1",
+    "setuptools==80.9.0",
+]
+
+[project.scripts]
+ddc = "ddc:main"
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"

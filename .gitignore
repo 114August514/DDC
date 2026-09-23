@@ -1,0 +1,19 @@
+# Virtual environment (managed by uv, ~5GB)
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Datasets (downloaded by RecBole, reproducible, ~260MB)
+dataset/
+
+# Runtime outputs: checkpoints and logs (large / regenerable)
+saved/
+log/
+log_tensorboard/
+
+# Editor / OS junk
+.vscode/
+.DS_Store
