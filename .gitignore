@@ -11,6 +11,7 @@ dataset/
 
 # Runtime outputs: checkpoints and logs (large / regenerable)
 saved/
+saved_finetune/
 log/
 log_tensorboard/
 
