@@ -54,6 +54,53 @@ new_Collector.get_data_struct = get_data_struct_new
 # --- End of Monkey-patching ---
 
 
+def user_norm_scale(user_embeddings, scale_by_user_norm):
+    """Per-user multiplier in front of e_pop and e_pref.
+
+    Released code uses ||e_u||. The paper adds alpha e_pop and beta e_pref
+    with no extra magnitude, which is a column of ones.
+    """
+    if scale_by_user_norm:
+        return torch.norm(user_embeddings, p=2, dim=-1, keepdim=True)
+    return torch.ones(
+        *user_embeddings.shape[:-1],
+        1,
+        device=user_embeddings.device,
+        dtype=user_embeddings.dtype,
+    )
+
+
+def combine_e_pre(selected_item_embeds, selected_scores, agg_mode, formula):
+    """Build one user's e_pref from the selected item embeddings.
+
+    released: L2-normalize each item, aggregate, then L2-normalize.
+    paper: Equation (10), L2-normalize the sum of the raw embeddings.
+    normalize(sum) equals normalize(mean), so the paper path does not use agg_mode.
+    """
+    if formula == "paper":
+        if agg_mode != "mean":
+            raise ValueError(
+                "paper e_pref is the normalized sum of raw embeddings; "
+                "epre_agg_mode must stay mean"
+            )
+        return F.normalize(selected_item_embeds.sum(dim=0), p=2, dim=0)
+    if formula != "released":
+        raise ValueError(f"Unknown e_pre formula: {formula}")
+
+    selected_item_embeds = F.normalize(selected_item_embeds, p=2, dim=1)
+    if agg_mode == "mean":
+        e_pre_user = torch.mean(selected_item_embeds, dim=0)
+    elif agg_mode == "sort_weight":
+        weights = F.softmax(selected_scores, dim=0).unsqueeze(1)
+        e_pre_user = torch.sum(selected_item_embeds * weights, dim=0)
+    elif agg_mode == "sort_inv_weight":
+        weights = F.softmax(1.0 / (selected_scores + 1e-9), dim=0).unsqueeze(1)
+        e_pre_user = torch.sum(selected_item_embeds * weights, dim=0)
+    else:
+        raise ValueError(f"Unknown e_pre aggregation mode: {agg_mode}")
+    return F.normalize(e_pre_user, p=2, dim=0)
+
+
 # --- ANONYMOUS PATH CONFIGURATION ---
 # NOTE TO REVIEWERS: Please replace the placeholder paths below with the actual paths
 # to your pre-trained model file and the generated popularity direction file.
@@ -113,6 +160,9 @@ class LightGCNDebiasFinetune(GeneralRecommender):
         self.use_epre = config["use_epre"]
         self.not_use_normalization = config["no_epre_normalization"]
         self.use_all_item = config["use_all_item"]
+        # Released multiplies corrections by ||e_u||. Paper Equations (11)-(14) do not.
+        self.scale_by_user_norm = config["scale_by_user_norm"]
+        self.epre_formula = config["epre_formula"]
         if self.use_epre:
             self.betas = nn.Parameter(
                 torch.FloatTensor(self.n_users).uniform_(-0.5, 0.5)
@@ -236,25 +286,14 @@ class LightGCNDebiasFinetune(GeneralRecommender):
                 raise ValueError(f"Unknown e_pre select mode: {select_mode}")
 
             selected_item_embeds = interacted_item_embeds[selected_indices]
-
-            # Normalize each item embedding before combination
-            selected_item_embeds = F.normalize(selected_item_embeds, p=2, dim=1)
-
-            if agg_mode == "mean":
-                e_pre_user = torch.mean(selected_item_embeds, dim=0)
-            elif agg_mode == "sort_weight":
-                weights = F.softmax(sort_values[selected_indices], dim=0).unsqueeze(1)
-                e_pre_user = torch.sum(selected_item_embeds * weights, dim=0)
-            elif agg_mode == "sort_inv_weight":
-                weights = F.softmax(
-                    1.0 / (sort_values[selected_indices] + 1e-9), dim=0
-                ).unsqueeze(1)
-                e_pre_user = torch.sum(selected_item_embeds * weights, dim=0)
-            else:
-                raise ValueError(f"Unknown e_pre aggregation mode: {agg_mode}")
-
-            # Final normalization
-            all_e_pre.append(F.normalize(e_pre_user, p=2, dim=0))
+            all_e_pre.append(
+                combine_e_pre(
+                    selected_item_embeds,
+                    sort_values[selected_indices],
+                    agg_mode,
+                    config["epre_formula"],
+                )
+            )
 
         return torch.stack(all_e_pre, dim=0)
 
@@ -271,11 +310,11 @@ class LightGCNDebiasFinetune(GeneralRecommender):
     def _get_modified_user_embeddings(self, users, for_pos, for_neg):
         """Construct different user_embeddings for positive and negative samples based on the loss_combination configuration."""
         user_embeds_orig_batch = self.user_embeds_orig[users]
-        user_norms = torch.norm(user_embeds_orig_batch, p=2, dim=1, keepdim=True)
+        user_scale = user_norm_scale(user_embeds_orig_batch, self.scale_by_user_norm)
 
         alpha_term = (
             self.alphas[users].unsqueeze(1)
-            * user_norms
+            * user_scale
             * self.popularity_direction_norm
         )
 
@@ -283,7 +322,7 @@ class LightGCNDebiasFinetune(GeneralRecommender):
         if self.use_epre:
             beta_term = (
                 self.betas[users].unsqueeze(1)
-                * user_norms
+                * user_scale
                 * self.e_pre_all_users[users]
             )
 
@@ -316,14 +355,14 @@ class LightGCNDebiasFinetune(GeneralRecommender):
         Forward pass for final prediction.
         The final user embedding is always: e_orig + alpha_term + beta_term.
         """
-        user_norms = torch.norm(self.user_embeds_orig, p=2, dim=1, keepdim=True)
+        user_scale = user_norm_scale(self.user_embeds_orig, self.scale_by_user_norm)
         alpha_term = (
-            self.alphas.unsqueeze(1) * user_norms * self.popularity_direction_norm
+            self.alphas.unsqueeze(1) * user_scale * self.popularity_direction_norm
         )
 
         beta_term = 0.0
         if self.use_epre:
-            beta_term = self.betas.unsqueeze(1) * user_norms * self.e_pre_all_users
+            beta_term = self.betas.unsqueeze(1) * user_scale * self.e_pre_all_users
         if self.prediction_mode == "full":
             modified_user_embeddings = self.user_embeds_orig + alpha_term + beta_term
         if self.prediction_mode == "no_pop":
@@ -413,7 +452,12 @@ if __name__ == "__main__":
 
     # --- Basic Settings ---
     # parser.add_argument('--model_file', type=str, default=DEFAULT_MODEL_FILE, help='Path to the pretrained LightGCN model file.')
-    # parser.add_argument('--rep_dir_file', type=str, default=DEFAULT_REP_DIRECTION_FILE, help='Path to the popularity direction json file.')
+    parser.add_argument(
+        "--rep_dir_file",
+        type=str,
+        default=None,
+        help="Popularity direction JSON. Defaults to DEFAULT_REP_DIRECTION_FILE[dataset_index], the released vector.",
+    )
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU ID to use.")
     parser.add_argument("--dataset_index", type=int, default=0)
 
@@ -434,6 +478,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--not_use_normalization", action="store_true")
     parser.add_argument("--use_all_item", action="store_true")
+    parser.add_argument(
+        "--no_user_norm_scale",
+        action="store_true",
+        help="Paper Equations (11)-(14): add alpha e_pop and beta e_pref without multiplying by ||e_u||.",
+    )
+    parser.add_argument(
+        "--epre_formula",
+        type=str,
+        default="released",
+        choices=["released", "paper"],
+        help="released: L2 each item, aggregate, L2 again. paper: Equation (10), L2 of the sum of raw embeddings.",
+    )
     parser.add_argument("--random_pop_direction", action="store_true")
     parser.add_argument("--random_pre_direction", action="store_true")
     parser.add_argument(
@@ -518,6 +574,8 @@ if __name__ == "__main__":
     config["gamma_mode"] = args.gamma_mode
     config["use_epre"] = args.use_epre
     config["no_epre_normalization"] = args.not_use_normalization
+    config["scale_by_user_norm"] = not args.no_user_norm_scale
+    config["epre_formula"] = args.epre_formula
     config["random_pop_direction"] = args.random_pop_direction
     config["random_pre_direction"] = args.random_pre_direction
     config["use_all_item"] = args.use_all_item
@@ -551,8 +609,9 @@ if __name__ == "__main__":
     logger.info("Pretrained LightGCN model loaded successfully.")
 
     # -- 2. Load and Process Popularity Direction Vector --
-    logger.info("Loading and normalizing popularity direction...")
-    with open(DEFAULT_REP_DIRECTION_FILE[args.dataset_index], "r") as f:
+    rep_dir_file = args.rep_dir_file or DEFAULT_REP_DIRECTION_FILE[args.dataset_index]
+    logger.info(f"Loading and normalizing popularity direction from {rep_dir_file}")
+    with open(rep_dir_file, "r") as f:
         rep_direction_data = json.load(f)
 
     rep_direction = rep_direction_data[1]["value"]["0"]
